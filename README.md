@@ -3,4 +3,4 @@ Long-term archive for "An Item Response Theory Evaluation of aLanguage-Independe
 
 This archive contains code used to conduct the analysis, example data files, and figures related to distractor analysis that could not fit in the paper.
 
-See README.pdf for more information on this archive and this paper as a whole.
+See [README.pdf](https://github.com/codeandcognition/archive-2019sigcse-xie/blob/master/README.pdf) for more information on this archive and this paper as a whole.
