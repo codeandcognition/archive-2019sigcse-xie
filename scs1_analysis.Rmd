@@ -1,0 +1,947 @@
+---
+title: "SCS1 Analysis"
+output: html_notebook
+---
+
+Data comes from 3 files: UW, GT pre, GT post. Some of UW students were pre-CS1 (about to start CS1 course) and others were pre-CS2 (about to start 2nd CS course). Cleaning data to drop mostly unanswered responses, responses that were too short or too long in time.
+UW had survey data (GT did not) and we considered conducting DIF analysis to compare gender, PLs known, language spoken. Sample size was too small, so we did not continue it further.
+CTT analysis was done  (`ltm::descript`) to get reliability via Cronbach's alpha. Confirmatory factor analysis on pretest data (is.pre==TRUE) to confirm SCS1 is unidimensional. Some items (20,24,27) were then dropped and then IRT modeling was done. 2PL model was selected b/c all items fit. Some items were found to have too great of difficulty (>3). All items had positive discrimination, although some did not have ideal discrimination (0.8-2.5). Ability levels were also estimated and plotted against item difficulty with a Wright Plot.
+
+# Cleaning SCS1 Data
+Objective of this notebook is to clean SCS1 data to produce a dataframe with "valid" response options (1-5) and correctness (0,1). We define valid as...
+- Spending 10 - 70 min on exam
+- at least 1 response
+output: `scs1_clean`: invalid rows removed, all columns preserved and columns for correctness added
+```{r}
+# install packages if you don't have them (may take time)
+list.of.packages <- c("dplyr", "ggplot2", "gridExtra", "ltm", "psych", "reshape2", "mirt", "plyr", "lavaan", "RColorBrewer", "WrightMap", "extrafont")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+
+library(dplyr) # data manipulation
+library(ggplot2) # plotting
+library(gridExtra) # multiple plots
+library(ltm) # CTT & IRT analyses
+library(psych)
+library(reshape2) # making multiple plots
+library(mirt)
+library(plyr) # revalue
+library(lavaan)
+library(RColorBrewer)
+library(WrightMap)
+
+library(extrafont)
+
+loadfonts()
+.onLoad <- function(libname,pkgname) {
+  pdfFonts <- grDevices::pdfFonts
+  extrafont::loadfonts("pdf",quiet=T)
+}
+
+FONT_SELECTED <- "Times New Roman"
+FONT_USED = "Times New Roman"
+# FONT_USED = "Garamond"
+par(family = FONT_USED)
+```
+
+# importing data
+```{r}
+scs1_all <- read.csv("data_sample/scs1.csv") # all data, no demographics
+# View(scs1)
+
+scs1_uw <- read.csv("data_sample/scs1_with_demographics.csv", na.strings=c("NA","NaN", "", " ")) # empty strings are NA
+
+# the data that will be used
+scs1 <- scs1_uw
+
+# removing first 2 rows
+scs1 <- scs1 %>% filter(!is.na(as.numeric(as.character(Progress))))
+```
+
+# data cleaning: timing
+```{r}
+# filter so only tests that are 10-70 min long
+TIME_MIN <- 60 * 10 # 10 min in seconds
+TIME_MAX <- 60 * 70 # 70 min in seconds
+scs1$Duration..in.seconds. <- as.integer(scs1$Duration..in.seconds.)
+# scs1 <- scs1 %>% filter(Duration..in.seconds. > TIME_MIN & Duration..in.seconds. < TIME_MAX)
+
+# dataframe of items only
+first_q_index <- match("Q1", colnames(scs1))
+NUM_QUESTIONS <- 27
+
+# changing date type
+scs1$date <- as.POSIXct(strptime(as.character(scs1$StartDate), "%m/%d/%y %H:%M"))
+
+# analysis to determine how many items need to be filled out
+scs1_items <- scs1[,first_q_index:(first_q_index+NUM_QUESTIONS-1)]
+na_count <- data.frame(sapply(scs1_items, function(x) sum(length(which(is.na(x))))))
+colnames(na_count) <- c("na_count_cum")
+head(na_count)
+ggplot(na_count, aes(1:27, na_count_cum)) + geom_line() +
+  labs(x="Item Number", y="Cumulative number of non-responses", title = "Cumulative Number of Non-Responses by Item") + theme_minimal() 
+# elbow at 10 => filter so at least 10 items filled out
+```
+
+```{r}
+# filter so only tests w/ at least 10 items answered are considered
+scs1 <- scs1 %>% filter(!is.na(Q10))
+```
+
+# data cleaning w/ demographic data (columns drops, renames)
+```{r}
+# rename column names for survey responses
+survey.map <- c("D1" = "s.age",
+                "D2" = "s.gender",
+                "D2_3_TEXT" = "s.gender.free",
+                "D3" = "s.ethnicity",
+                "D3_6_TEXT" = "s.ethnicity.free",
+                "D4" = "s.language",
+                "D4_11_TEXT" = "s.language.free",
+                "D6" = "s.zip", 
+                "D7" = "s.pre.post",
+                "D8" = "s.first.exp",
+                "D9" = "s.skill",
+                "D10" = "s.prior.exp",
+                "D10_8_TEXT" = "s.prior.exp.free",
+                "D11" = "s.pl",
+                "D11_17_TEXT" = "s.pl.free",
+                "D12" = "s.ide",
+                "D12_12_TEXT" = "s.ide.free",
+                "D13" = "s.used",
+                "D13_6_TEXT" = "s.used.free",
+                "D14_1" = "s.likert.courses",
+                "D14_2" = "s.likert.life",
+                "D14_3" = "s.likert.career",
+                "D14_4" = "s.likert.communicate",
+                "D14_5" = "s.likert.communicate.prog",
+                "D15" = "s.times.before"
+                )
+
+# drop some irrelevant columns
+if("Status" %in% colnames(scs1)){
+  scs1 <- scs1 %>% dplyr::select(-c(Status, RecipientLastName, RecipientFirstName, RecipientEmail, ExternalReference, LocationLatitude, LocationLongitude, DistributionChannel, D12_12_TEXT...Topics))  
+}
+
+# rename columns names for survey data
+colnames(scs1) <- revalue(colnames(scs1), survey.map)
+```
+
+
+# determine if pre or post test
+```{r}
+
+id.is.post <- function(id){
+  id <- tolower(id)
+  is.post <- NA
+  if(grepl("pre", id)){
+    is.post <- FALSE
+  }
+  if(grepl("post", id)) {
+    is.post <- TRUE
+  }
+  is.post
+}
+
+id.is.info <- function(id){
+  id <- tolower(id)
+  is.info <- NA
+  if(grepl("info", id) || grepl("285", id)){
+    is.info <- TRUE
+  }
+  if(grepl("6518", id) || grepl("6815", id)) {
+    is.info <- FALSE
+  }
+  is.info
+}
+
+scs1$is.post <- as.logical(lapply(scs1$ID, id.is.post))
+scs1$is.info <- as.logical(lapply(scs1$ID, id.is.info))
+scs1$is.pre.cs1 <- !scs1$is.info # info students are pre CS2 => not pre CS1
+```
+
+Checking demographic counts to determine if enough data for DIF, reporting demographics
+```{r}
+# seeing how many for each gender and type of test
+# male/pre: 60. female/pre: 46. male/post: 63. female/post: 45
+count(scs1%>%filter(is.post==FALSE), c('s.gender'))
+count(scs1%>%filter(is.post==FALSE), c('s.age', "is.pre.cs1"))
+# View(count(scs1%>%filter(is.post==FALSE), c('s.language')))
+# count(!is.na(scs1$is.post))
+
+# looking at those that were not coded as pre or posttest
+# View(scs1 %>% filter(is.na(is.post))) # 6585 is a common pattern to a lot of these IDs but I can't find it anywhere in the PL tutor study. Interesting
+```
+
+# data on PLs previously used (to see if enough data for DIF)
+Not enough for DIF
+```{r}
+count(scs1$s.pl) %>% arrange(-freq)
+
+PL.PYTHON <- "1"
+PL.JAVA <- "2"
+PL.SCRATCH <- "3"
+PL.JS <- "8"
+
+# given a list of PLs (as in from scs1$s.pl), return True if python previously known
+pl.proficient.python <- function(langs) {
+  PL.PYTHON %in% as.list(strsplit(as.character(langs), ","))[[1]]
+}
+
+# given a list of PLs (as in from scs1$s.pl), return True if Java previously known
+pl.proficient.java <- function(langs) {
+  PL.JAVA %in% as.list(strsplit(as.character(langs), ","))[[1]]
+}
+
+# new columns that are true if language previously known, false otherwise
+scs1$pl.python <- as.logical(lapply(scs1$s.pl, pl.proficient.python))
+scs1$pl.java <- as.logical(lapply(scs1$s.pl, pl.proficient.java))
+
+# break down of prior PL knowledge
+# count(scs1, c('pl.python', 'pl.java')) # 104 know Java and not Python. 13 know Python but not Java. =(
+count(scs1%>%filter(is.post==FALSE), c('pl.java', 'is.pre.cs1')) # can split by know Java & don't know Java, but that's not super interesting.
+```
+
+# Checking counts for DIF analysis
+```{r}
+# TODO
+scs1 %>% filter(s.gender==1, is.post==FALSE) # male pretest
+scs1 %>% filter(s.gender==2, is.post==FALSE) # female pretest
+scs1 %>% filter(s.gender==1, is.post==TRUE) # male posttest
+scs1 %>% filter(s.gender==2, is.post==TRUE) # female posttest
+```
+
+
+# Adding GT data on pre and post tests (for factor analysis, IRT modeling)
+```{r}
+scs1$is.uw <- TRUE
+
+# add all GT pre test data 
+scs1_gt_pre <- read.csv("data_sample/SCS1_PreTest_OnlineCS1.csv", na.strings=c("NA","NaN", "", " "))
+scs1_gt_pre$is.post <- FALSE
+
+# add all GT post test data
+scs1_gt_post <- read.csv("data_sample/SCS1_PostTest_OnlineCS1.csv", na.strings=c("NA","NaN", "", " "))
+scs1_gt_post$is.post <- TRUE
+
+# merge GT data
+gt_cname_overlap <- intersect(colnames(scs1_gt_pre), colnames(scs1_gt_post))
+scs1_gt <- rbind(scs1_gt_pre %>% dplyr::select(gt_cname_overlap), scs1_gt_post %>% dplyr::select(gt_cname_overlap))
+
+# adding columns which scs1_uw has
+scs1_gt$is.uw <- FALSE
+scs1_gt$is.info <- NA
+scs1_gt$is.pre.cs1 <- TRUE
+
+# merge w/ UW data
+cname_overlap <- intersect(colnames(scs1), colnames(scs1_gt))
+scs1_all <- rbind(scs1_gt %>% dplyr::select(cname_overlap), scs1 %>% dplyr::select(cname_overlap))
+
+# removing irrelevant rows
+scs1_all <- scs1_all %>% filter(!is.na(as.numeric(as.character(Progress))))
+
+# filter so at least 10 questions filled out
+scs1_all <- scs1_all %>% filter(!is.na(Q10))
+
+# separate pre and post data
+scs1_pre <- scs1_all %>% filter(is.post==FALSE)
+scs1_post <- scs1_all %>% filter(is.post==TRUE)
+```
+
+# Breakdown of response demographics (pre-CS1 or pre CS2, UW or GT)
+```{r}
+nrow(scs1_pre)
+xtabs(~is.uw+is.pre.cs1, data=scs1_pre)
+```
+
+# determining item correctness
+Answers from scs1_answers.csv. COuld have been done more easily with mirt::key2binary
+```{r}
+# df of items only
+item_cols <- c("Q1", "Q2", "Q3", "Q4", "Q5", "Q6", "Q7", "Q8", "Q9", "Q10", "Q11", "Q12", "Q13", "Q14", "Q15", "Q16","Q17", "Q18", "Q19", "Q20", "Q21", "Q22", "Q23", "Q24", "Q25", "Q26", "Q27")
+scs1_items <- scs1_all[,item_cols]
+
+# answer key
+scs1_answer_key <- read.csv("data_sample/scs1_answers_FAKE.csv") # SAMPLE ANSWERS ARE NOT ACTUALLY CORRECT. This is to protect integrity of instrument. Please contact SCS1 administrators for actual answers.
+
+# match(scs1_answer_key$Answer[1], scs1_items[,1])
+
+score_cols <- c() # name of all columns w/ item scores
+
+# creating dataframe of dichotomous responses. NEXT TIME USE mirt::key2binary
+for(i in 1:NUM_QUESTIONS){
+  col_q <- paste("Q",i,sep='')
+  col_score <- paste("score",i,sep='')
+  score_cols <- append(score_cols, col_score)
+  # score_names <- c(score_names, col_score)
+  
+  # colnames(scs1_scores)[i] <- col_score
+  scs1_all[col_score] <- lapply(scs1_items[col_q], function(x) ifelse(is.na(x), 0, ifelse(scs1_answer_key$Answer[i] == x, 1, 0))) # 1 if right, 0 if not or NA
+  
+  # if( sum(scs1_items[, col_q] == scs1_answer_key$Answer[i]) != sum(scs1_scores[, col_score])) {print(paste("invald: ", col_q))}
+}
+
+scs1_scores <- scs1_all[,score_cols]
+
+scs1_pre <- scs1_all %>% filter(is.post==FALSE)
+scs1_pre_cs1 <- scs1_pre %>% filter(is.pre.cs1 == TRUE)
+scs1_pre_cs2 <- scs1_pre %>% filter(is.pre.cs1 == FALSE)
+
+scs1_scores_pre <- scs1_pre[,score_cols]
+scs1_scores_pre_cs1 <- scs1_pre_cs1[,score_cols]
+scs1_scores_pre_cs2 <- scs1_pre_cs2[,score_cols]
+
+# write.csv(scs1_scores, "scs1_scores_pretest_all.csv")
+# write.csv(scs1_scores_pre_cs1, "scs1_scores_pretest_precs1.csv")
+# write.csv(scs1_scores_pre_cs2, "scs1_scores_pretest_precs2.csv")
+
+# DROPPED_ITEMS <- c("score19", "score26", "score27") # items that I drop b/c they are troublesome
+# scs1_scores_pruned <- scs1_scores %>% dplyr::select(-one_of(DROPPED_ITEMS))
+
+# View(scs1_items)
+# View(scs1_scores)
+
+scs1_items_pre <- scs1_pre[,item_cols]
+scs1_items_pre_cs1 <- scs1_pre_cs1[,item_cols]
+scs1_items_pre_cs2 <- scs1_pre_cs2[,item_cols]
+```
+
+# Distractor Analysis (CTT)
+Frequency of response for each option
+```{r}
+get_response_freq <- function(item_data, answer_key=scs1_answer_key) {
+  # converting from factor to double
+  item_data[] <- lapply(item_data, function(x) {
+    if(is.factor(x)) as.numeric(as.character(x)) else x
+    })
+  
+  responses <- melt(item_data)
+  response_count <- xtabs(~variable+value, data=responses)
+  
+  response_prop <- apply(response_count, 1, function(x){x/sum(x, na.rm=TRUE)})
+  
+  responses$correct_answer <- apply(responses, 1, function(x){
+    q_num <- as.numeric(substring(x[1], 2))
+    answer_key$Answer[q_num]
+  })
+  responses$correct = responses$correct_answer == responses$value # not sure why has to be 2 steps...
+  # View(scs1_responses)
+  
+  responses
+}
+
+```
+
+# sandbox for getting distractor data (turned into function above)
+```{r}
+# # converting from factor to double
+# scs1_items_pre[] <- lapply(scs1_items_pre, function(x) {
+#     if(is.factor(x)) as.numeric(as.character(x)) else x
+# })
+# 
+# scs1_responses <- melt(scs1_items_pre)
+# 
+# scs1_response_count <- xtabs(~variable+value, data = scs1_responses)
+# # rowSums(scs1_response_count) # sanity check. values should be descending
+# 
+# scs1_response_prop <- apply(scs1_response_count, 1, function(x){x/sum(x, na.rm=TRUE)})
+# 
+# # seeing which distractors unused
+# # scs1_response_prop<0.05
+# 
+# # adding correctness
+# scs1_responses$correct_answer <- apply(scs1_responses, 1, function(x){
+#   q_num <- as.numeric(substring(x[1], 2))
+#   scs1_answer_key$Answer[q_num]
+# })
+# scs1_responses$correct = scs1_responses$correct_answer == scs1_responses$value # not sure why has to be 2 steps...
+
+# View(scs1_responses)
+
+# ggplot(scs1_responses,aes(x=value)) + geom_histogram(aes(fill=correct)) + facet_wrap(~variable) + labs(title = "Frequency of Responses by Item", x="Response", y="Number of Responses") + theme_minimal()
+
+# ggplot(scs1_responses,aes(x=value)) + geom_histogram(aes(fill=correct)) + facet_wrap(~variable) + labs(title = "Frequency of Responses by Item", x="Response", y="Number of Responses") + theme_minimal()
+
+```
+
+# histogram of option selection (visual of distractors)
+Highlighting 1 bar in histogram: https://stackoverflow.com/a/41794952
+```{r}
+scs1_responses <- get_response_freq(scs1_items_pre)
+scs1_responses_cs1 <- get_response_freq(scs1_items_pre_cs1)
+scs1_responses_cs2 <- get_response_freq(scs1_items_pre_cs2)
+
+ggplot(scs1_responses,aes(x=value)) + geom_histogram(aes(fill=correct)) + facet_wrap(~variable) + labs(title = "Frequency of Pretest Responses by Item", x="Response", y="Number of Responses") + theme_minimal()
+ggplot(scs1_responses_cs1,aes(x=value)) + geom_histogram(aes(fill=correct)) + facet_wrap(~variable) + labs(title = "Frequency of Pre-CS1 Pretest Responses by Item", x="Response", y="Number of Responses") + theme_minimal()
+ggplot(scs1_responses_cs2,aes(x=value)) + geom_histogram(aes(fill=correct)) + facet_wrap(~variable) + labs(title = "Frequency of Pre-CS2 Pretest Responses by Item", x="Response", y="Number of Responses") + theme_minimal()
+```
+
+```{r}
+ggplot(scs1_responses %>% filter(variable=="Q20"),aes(x=value)) + geom_histogram(aes(fill=correct)) + facet_wrap(~variable) + labs(title = "Frequency of Pretest Responses by Item", x="Response", y="Number of Responses") + theme_minimal()
+
+xtabs(~value, data=scs1_responses %>% filter(variable=="Q20")) / 489
+
+```
+
+
+# Factor analysis
+## CFA Proposed by Matt Davidson
+```{r}
+#setting up data to be ordered, so lavaan will use the tetrachoric correlation
+cfa_pre <- scs1_all %>% filter(is.post==FALSE) %>% dplyr::select(score_cols) %>% mutate_all(funs(ordered(.)))
+cfa_pre_cs1 <- scs1_all %>% filter(is.post==FALSE, is.pre.cs1==TRUE) %>% dplyr::select(score_cols) %>% mutate_all(funs(ordered(.)))
+cfa_pre_cs2 <- scs1_all %>% filter(is.post==FALSE, is.pre.cs1==FALSE) %>% dplyr::select(score_cols) %>% mutate_all(funs(ordered(.)))
+# cfa_post <- scs1_all[scs1_all$is.post==TRUE,][,score_cols] %>% mutate_all(funs(ordered(.)))
+
+cfa_model_1 <- 'factor =~ score1 + score2 + score3 + score4 + score5 + score6 + score7 + score8 + score9 + score10 + score11 + score12 + score13 + score14 + score15 + score16 + score17 + score18 + score19 + score20 + score21 + score22 + score23 + score24 + score25 + score26 + score27'
+
+cfa_fit_1_pre <- cfa(cfa_model_1, data=cfa_pre, std.lv=TRUE) #if there is any missing data, you can add the argument "missing="fiml"
+cfa_fit_1_pre_cs1 <- cfa(cfa_model_1, data=cfa_pre_cs1, std.lv=TRUE) #if there is any missing data, you can add the argument "missing="fiml"
+cfa_fit_1_pre_cs2 <- cfa(cfa_model_1, data=cfa_pre_cs2, std.lv=TRUE) #if there is any missing data, you can add the argument "missing="fiml"
+# cfa_fit_1_post <- cfa(cfa_model_1, data=cfa_post, std.lv=TRUE)
+
+cfa_pre_res <- resid(cfa_fit_1_pre)
+cfa_pre_res_cs1 <- resid(cfa_fit_1_pre_cs1)
+cfa_pre_res_cs2 <- resid(cfa_fit_1_pre_cs2)
+
+# write(cfa_pre_res$cov, "cfa_1factor_cov.csv")
+
+cfa_pre_res
+cfa_pre_res_cs1
+cfa_pre_res_cs2
+```
+
+## Interpretting CFA results
+Model Fit Test Statistic is a chi-square test of the overall model fit. We'd like this to have p > .05. If it's lower
+than .05, it just means that the model doesn't fit perfectly, which would be an unsurprising result. If p > .05, we go on to other indices.
+
+RMSEA: We'd like this to be between .05 and .08, ideally. RMSEA is reported with a confidence interval--if the lower or upper bound is in the range of .05 and .08, we are probably ok.
+
+We can also look to CFI and TLI. Ideally both are > .9, but higher is always better.
+
+Because we have some good theory to support the idea that a 1-factor model is correct, as long as the fit indices
+are acceptable we should be ok.
+
+If the indices are terrible, we can look at the performance of individual questions as well as modification indices. I can do those, as they are a bit more tricky to interpret. You can get a quick idea if any one question is behaving poorly by looking at the "estimate" column under "latent variables" in the summary output above.
+```{r}
+cfa_summary <- summary(cfa_fit_1_pre, fit.measures=TRUE, standardized=TRUE)
+# summary(cfa_fit_1_pre_cs1, fit.measures=TRUE, standardized=TRUE)
+# summary(cfa_fit_1_pre_cs2, fit.measures=TRUE, standardized=TRUE)
+
+# summary(cfa_fit_1_post, fit.measures=TRUE, standardized=TRUE)
+```
+formatting FA data 
+```{r}
+# cfa_loadings <- read.csv("cfa_1factor_loading.csv")
+# cfa_loadings$formatted <- paste(paste(round(cfa_loadings$Estimate, digits=2), round(cfa_loadings$Std..Error, digits=2), sep=" ("), ")", sep="")
+# write.csv(cfa_loadings, file="cfa_1factor_loading.csv")
+
+```
+
+
+Seeing if sample size affects CFA for this data
+=> appears that same size of pre-CS2 is too small and CFA is unstable (2 out of 4 random samples of that size result in almost all negatives)
+```{r}
+N <- nrow(cfa_pre_cs2)
+# N <- 40
+# set.seed(2018) # everything negative
+# set.seed(015) # ok
+# set.seed(111) # ok
+# set.seed(314) # negative
+cfa_pre_rand <- scs1_all %>% filter(is.post==FALSE)
+cfa_pre_rand <- sample_n(cfa_pre_rand, N) %>% dplyr::select(score_cols) %>% mutate_all(funs(ordered(.)))
+
+cfa_fit_1_rand <- cfa(cfa_model_1, data=cfa_pre_rand, std.lv=TRUE)
+
+summary(cfa_fit_1_rand, fit.measures=TRUE, standardized=TRUE)
+
+```
+
+## Old CFA analysis (to be dropped?)
+```{r}
+# # correlation matrix
+# r = cor(scs1_scores, use="complete.obs")
+# r
+# 
+# # standardize data
+# scs1_scores_scaled <- as.data.frame(scale(scs1_scores))
+# # View(scs1_scores_scaled)
+# 
+# # tests to ensure FA appropriate
+# # bartlett test - want a small p value here to indicate correlation matrix not zeros
+# cortest.bartlett(r, nrow(scs1_scores_scaled))
+# # unable to calculatell the kmo
+# KMO(r)
+# # calclate the determinant need it to be above 0.00001
+# det(cor(scs1_scores_scaled))
+# ```
+# ## Exploratory FA (not used)
+# ```{r}
+# # efa = factanal(scs1_scores_scaled, factors = 2, rotation="varimax")
+# # load = efa$loadings[, 1:2]
+# # plot(load, type="n")
+# # text(load, labels = names(scs1_scores_scaled), cex = 0.7)
+# 
+# # perform a 2-factor EFA
+# efa2 = fa(r, nfactors=3)
+# # look at the loading
+# print(efa2$loadings)
+# print(efa2$loadings, cutoff = 0.3)
+# summary(efa2)
+# 1# diagram the relationship
+# fa.diagram(efa2)
+```
+
+# REMOVING ITEMS W/ POOR FACTOR LOADING
+# Comment out these lines to run analysis on all of test
+```{r}
+DROPPED_ITEMS <-c("Q20", "Q24", "Q27")
+DROPPED_SCORES <-  c("score20", "score24", "score27")
+
+scs1_scores_pre <- scs1_scores_pre[, !colnames(scs1_scores_pre) %in% DROPPED_SCORES]
+scs1_scores_pre_cs1 <- scs1_scores_pre_cs1[, !colnames(scs1_scores_pre_cs1) %in% DROPPED_SCORES]
+scs1_scores_pre_cs2 <- scs1_scores_pre_cs2[, !colnames(scs1_scores_pre_cs2) %in% DROPPED_SCORES]
+
+item_cols <- item_cols[!item_cols %in% DROPPED_ITEMS] #Q1, Q2, ...
+```
+
+# CTT Analysis
+```{r}
+ctt <- ltm::descript(scs1_scores_pre)
+ctt # difficulty, distractor (point-biserial), cronbach's alpha
+# write.csv(ctt$perc, file = "ctt_all_perc.csv")
+# write.csv(ctt$bisCorr, file = "ctt_all_biserial.csv")
+# write.csv(ctt$alpha, file = "ctt_all_alpha.csv")
+
+ctt_cs1 <- ltm::descript(scs1_scores_pre_cs1)
+# write.csv(ctt_cs1$perc, file = "ctt_cs1_perc.csv")
+# write.csv(ctt_cs1$bisCorr, file = "ctt_cs1_biserial.csv")
+# write.csv(ctt_cs1$alpha, file = "ctt_cs1_alpha.csv")
+
+ctt_cs2 <- ltm::descript(scs1_scores_pre_cs2)
+# write.csv(ctt_cs2$perc, file = "ctt_cs2_perc.csv")
+# write.csv(ctt_cs2$bisCorr, file = "ctt_cs2_biserial.csv")
+# write.csv(ctt_cs2$alpha, file = "ctt_cs2_alpha.csv")
+
+# change in Cronbach's alpha if item dropped
+# ctt$alpha[1] - ctt$alpha
+# lapply(ctt$alpha, print)
+
+# alpha_comp <- psych::alpha(scs1_scores)
+# alpha_comp$item.stats$r.drop # item-test correlation
+```
+
+
+Function to compare performance of IRT models Rasch, 1PL, 2PL, 3PL and return DF with results
+```{r}
+FIT_THRESHOLD <- 0.0001
+run_irt <- function(scs1_data, type="?"){
+  # df to keep track of model performance
+  cnames <- c("model", "aic", "bic", "num_items_no_fit", "items_no_fit")
+  df_model_perf <- data.frame(matrix(ncol = length(cnames), nrow = 0))
+  colnames(df_model_perf) <- cnames
+
+  # Rasch
+  scs1.rm <- ltm::rasch(scs1_data, constr = cbind(ncol(scs1_data) + 1, 1)) #ncol + 1 to include discrimination, 1 to parameter
+  summary(scs1.rm) # model summary is used to compare model fit. coefficients tell you difficulty. convergence=0 means no errors
+  scs1.rm.summary = summary(scs1.rm)  
+  
+  scs1.rm.summary$coefficients
+  fit.rm <- item.fit(scs1.rm) # which items don't fit
+  df_model_perf[nrow(df_model_perf)+1,] <- c("rasch", scs1.rm.summary$AIC, scs1.rm.summary$BIC, sum(fit.rm$p.values<FIT_THRESHOLD),
+                                             paste(which(fit.rm$p.values<FIT_THRESHOLD), collapse=", "))
+  
+  ### 1PL
+  scs1.1pl <- ltm::rasch(scs1_data) # estimate discrimination parameters
+  summary(scs1.1pl)
+  scs1.1pl.summary = summary(scs1.1pl)
+  
+  scs1.1pl.summary$coefficients
+  fit.1pl <- item.fit(scs1.1pl) # 10 items don't fit!
+  df_model_perf[nrow(df_model_perf)+1,] <- c("1pl", scs1.1pl.summary$AIC, scs1.1pl.summary$BIC, sum(fit.1pl$p.values<FIT_THRESHOLD),
+                                             paste(which(fit.1pl$p.values<FIT_THRESHOLD), collapse=", "))
+  
+  colnames(scs1_data) <- item_cols # replacing "score" with Q
+
+  # 2PL
+  scs1.2pl <- ltm::ltm(scs1_data ~ z1, IRT.param = TRUE)
+  scs1.2pl.summary <- summary(scs1.2pl)
+  scs1.2pl.summary
+  
+  params.2pl <- data.frame(scs1.2pl.summary$coefficients)
+  params.2pl$formatted <- paste(paste(round(params.2pl$value, digits=2), round(params.2pl$std.err, digits=2), sep=" ("), ")", sep="")
+  write.csv(params.2pl, paste("2pl_summary_pre_", type, ".csv", sep=""))
+  
+  fit.2pl <- item.fit(scs1.2pl) 
+  # fit.2pl <- item.fit(scs1.2pl, simulate.p.value=TRUE) 
+  df_model_perf[nrow(df_model_perf)+1,] <- c("2pl", scs1.2pl.summary$AIC, scs1.2pl.summary$BIC, sum(fit.2pl$p.values<FIT_THRESHOLD),
+                                             paste(which(fit.2pl$p.values<FIT_THRESHOLD), collapse=", "))
+  
+  # 3PL SKIPPING b/c of small sample size for pre-CS2 resulting in non-convergence
+  # scs1.3pl <- ltm::tpm(scs1_data)
+  # scs1.3pl.summary <- summary(scs1.3pl)
+  # # write.csv(scs1.3pl.summary$coefficients, "data_scs1/3pl_summary.csv")
+  # 
+  # fit.3pl <- item.fit(scs1.3pl) 
+  # # fit.3pl <- item.fit(scs1.3pl, simulate.p.value = TRUE)  # takes awhile!
+  # 
+  # df_model_perf[nrow(df_model_perf)+1,] <- c("3pl", scs1.3pl.summary$AIC, scs1.3pl.summary$BIC, sum(fit.3pl$p.values<FIT_THRESHOLD),
+  #                                            paste(which(fit.3pl$p.values<FIT_THRESHOLD), collapse=", "))
+  
+  df_model_perf
+}
+```
+
+Comparing model performance for pre-test data of all, only pre-CS1, only pre-CS2
+```{r}
+# strange behavior for 3PL model. 
+perf_all <- run_irt(scs1_scores_pre, type="all") # 2PL model best (all items fit)
+perf_cs1 <- run_irt(scs1_scores_pre_cs1, type="precs1") # Rasch model fits best (highest AIC, BIC & all items fit). This is unusual 
+perf_cs2 <- run_irt(scs1_scores_pre_cs2, type="precs2") # 2PL best option (b/c 3PL model did not converge due to Hessian not being positive definite). AIC & BIC are order of magnitude lower. Not sure what that means
+
+scs1.2pl.cs1 <- ltm::ltm(scs1_scores_pre_cs1 ~ z1, IRT.param = TRUE)
+scs1.2pl.cs1.summary <- summary(scs1.2pl.cs1)
+
+params.2pl.cs1 <- data.frame(scs1.2pl.cs1.summary$coefficients)
+params.2pl.cs1$formatted <- paste(paste(round(params.2pl.cs1$value, digits=2), round(params.2pl.cs1$std.err, digits=2), sep=" ("), ")", sep="")
+# write.csv(params.2pl.cs1, "2pl_summary_pre_cs1.csv")
+
+scs1.2pl.cs2 <- ltm::ltm(scs1_scores_pre_cs2 ~ z1, IRT.param = TRUE)
+scs1.2pl.cs2.summary <- summary(scs1.2pl.cs2)
+
+params.2pl.cs2 <- data.frame(scs1.2pl.cs2.summary$coefficients)
+params.2pl.cs2$formatted <- paste(paste(round(params.2pl.cs2$value, digits=2), round(params.2pl.cs2$std.err, digits=2), sep=" ("), ")", sep="")
+# write.csv(params.2pl.cs2, "2pl_summary_pre_cs2.csv")
+```
+
+# IRT Analysis
+To find models, we tried models of increasing complexidty (rasch, 1PL, 2PL, 3PL) and checked AIC, BIC (lower is better), and # of items that fit.
+```{r}
+# df to keep track of model performance
+cnames <- c("model", "aic", "bic", "num_items_no_fit", "items_no_fit")
+df_model_perf <- data.frame(matrix(ncol = length(cnames), nrow = 0))
+colnames(df_model_perf) <- cnames
+FIT_THRESHOLD <- 0.0001
+
+# Rasch
+scs1.rm <- ltm::rasch(scs1_scores_pre, constr = cbind(ncol(scs1_scores_pre) + 1, 1)) #ncol + 1 to include discrimination, 1 to parameter
+summary(scs1.rm) # model summary is used to compare model fit. coefficients tell you difficulty. convergence=0 means no errors
+scs1.rm.summary = summary(scs1.rm)
+
+scs1.rm.summary$coefficients
+fit.rm <- item.fit(scs1.rm) # 6 items don't fit
+df_model_perf[nrow(df_model_perf)+1,] <- c("rasch", scs1.rm.summary$AIC, scs1.rm.summary$BIC, sum(fit.rm$p.values<FIT_THRESHOLD), paste(which(fit.rm$p.values<FIT_THRESHOLD), collapse=", "))
+
+### 1PL
+scs1.1pl <- ltm::rasch(scs1_scores_pre) # estimate discrimination parameters
+summary(scs1.1pl)
+scs1.1pl.summary = summary(scs1.1pl)
+
+scs1.1pl.summary$coefficients
+fit.1pl <- item.fit(scs1.1pl) # 10 items don't fit!
+df_model_perf[nrow(df_model_perf)+1,] <- c("1pl", scs1.1pl.summary$AIC, scs1.1pl.summary$BIC, sum(fit.1pl$p.values<FIT_THRESHOLD), paste(which(fit.1pl$p.values<FIT_THRESHOLD), collapse=", "))
+
+# ICC Plots for Rasch vs 1PL
+par(mfrow = c(2,2)) # grid of plots
+
+# Item characteristic plots
+# plot(scs1.rm, type="ICC", main="Rasch ICC")
+# plot(scs1.1pl, type="ICC", main="1PL ICC")
+
+# Item info plots
+# plot(scs1.rm, type = "IIC", main="Rasch Item Info")
+# plot(scs1.1pl, type = "IIC", main="1PL Item Info")
+
+# Test info plots (sum of all item info curves)
+# plot(scs1.rm, type = "IIC", items = 0, main="Rasch Test Info")
+# plot(scs1.1pl, type = "IIC", items = 0, main="1PL Test Info")
+```
+
+# 2PL Model
+The one we ended up using.
+```{r}
+colnames(scs1_scores_pre) <- item_cols # replacing "score" with Q
+# 2PL
+scs1.2pl <- ltm::ltm(scs1_scores_pre ~ z1, IRT.param = TRUE)
+scs1.2pl.summary <- summary(scs1.2pl)
+scs1.2pl.summary
+
+params.2pl <- data.frame(scs1.2pl.summary$coefficients)
+params.2pl$formatted <- paste(paste(round(params.2pl$value, digits=2), round(params.2pl$std.err, digits=2), sep=" ("), ")", sep="")
+# write.csv(params.2pl, "2pl_summary_pre.csv")
+
+fit.2pl <- item.fit(scs1.2pl) 
+# fit.2pl <- item.fit(scs1.2pl, simulate.p.value=TRUE) 
+df_model_perf[nrow(df_model_perf)+1,] <- c("2pl", scs1.2pl.summary$AIC, scs1.2pl.summary$BIC, sum(fit.2pl$p.values<FIT_THRESHOLD), paste(which(fit.2pl$p.values<FIT_THRESHOLD), collapse=", "))
+
+# ICC plots
+xlabel <- "Knowledge level"
+ylabel <- "Probability correct answer selected"
+thickness <- 4
+colorblind_palette <-  c("#000000", "#D54010", "#005B9E", "#7A0541", "#008C5D", "#24A2E1", "#C65B92", "#E98814")
+
+plot(scs1.2pl, type = "ICC", items = c(5, 13, 15, 18, 19),  col = colorblind_palette, main="2PL Item Characteristic Curve", xlab=xlabel, ylab=ylabel, family=FONT_SELECTED, lwd=thickness, annot=FALSE) # annot=FALSE to hid labels
+
+# just bad items
+plot(scs1.2pl, type = "ICC", items = c(5, 13, 15, 18),  col = colorblind_palette, main="2PL Item Characteristic Curve", xlab=xlabel, ylab=ylabel, family=FONT_SELECTED, lwd=thickness, annot=FALSE) # annot=FALSE to hid labels
+
+# plot(scs1.2pl, type = "ICC", items = c(5, 13, 15, 18),  col = colorblind_palette, main="2PL Item Characteristic Curve", xlab=xlabel, ylab=ylabel, family=FONT_SELECTED, lwd=thickness) # annot=FALSE to hid labels
+
+# just the good one
+# plot(scs1.2pl, type = "ICC", items = c(19),  col = colorblind_palette, main="2PL Item Characteristic Curve", xlab=xlabel, ylab=ylabel, family=FONT_SELECTED, lwd=thickness, annot=FALSE)
+
+
+# plot(scs1.2pl, type = "ICC", items = c(18,19,20,24,27),  col = colorblind_palette, main="2PL Item Characteristic Curve", font=71, font.axis=71, font.lab=71, font.main=71,xlab=xlabel, ylab=ylabel, family="Times New Roman", lwd=thickness)
+
+# c("#8c510a", "#bf812d", "#dfc27d", "#f6e8c3", "#c7eae5", "#80cdc1", "#35978f", "#01665e") # colorblind friendly
+# c("#000000", "#C65B92", "#D54010", "#005B9E", "#F0DE38", "#008C5D", "#24A2E1", "#E98814")
+
+# Test info plots (sum of all item info curves)
+thickness2 <- 5
+xlabel2 <- "Knowledge level"
+# plot(scs1.2pl, type = "IIC", items = 0, main="2PL Test Info")
+# dev.new(width=5, height=2, unit="in")
+plot(scs1.2pl, type = "IIC", items = 0, main="2PL Test Info", family=FONT_SELECTED, lwd=thickness2, xlab=xlabel2) # TODO: make this plot better (thicker liner for plot, font to Times New Roman, change x axist label to "knowlege level")
+
+
+# View(df_model_perf)
+```
+
+# 3PL Model (not using)
+```{r}
+# 3PL
+scs1.3pl <- ltm::tpm(scs1_scores_pre)
+# scs1.3pl.pruned <- ltm::tpm(scs1_scores_pruned) 
+scs1.3pl.summary <- summary(scs1.3pl)
+# write.csv(scs1.3pl.summary$coefficients, "data_scs1/3pl_summary.csv")
+
+fit.3pl <- item.fit(scs1.3pl) 
+# fit.3pl <- item.fit(scs1.3pl, simulate.p.value = TRUE)  # takes awhile!
+
+df_model_perf[nrow(df_model_perf)+1,] <- c("3pl", scs1.3pl.summary$AIC, scs1.3pl.summary$BIC, sum(fit.3pl$p.values<FIT_THRESHOLD), paste(which(fit.3pl$p.values<FIT_THRESHOLD), collapse=", "))
+
+# ICC plots
+# plot(scs1.3pl, type = "ICC", main="3PL Item Characteristic Curve")
+
+# Item info plots
+plot(scs1.2pl, type = "IIC", main="2PL Item Info")
+# plot(scs1.3pl, type = "IIC", main="3PL Item Info", items = 5:10)
+
+# Test info plots (sum of all item info curves)
+# plot(scs1.3pl, type = "IIC", items = 0, main="3PL Test Info")
+
+View(df_model_perf) # comparing model performance
+# write.csv(df_model_perf, file="data_scs1/model_perf.csv")
+```
+
+# Checking local independence with Yen's Q3 statistic
+```{r}
+scs1.2pl$X
+```
+
+
+## Seeing if Pre-CS1 data
+```{r}
+precs2.thetas <- ltm::factor.scores(scs1.2pl.cs1, resp.patterns = as.matrix(scs1_scores_pre_cs2), method="EAP")
+precs2.thetas$score.dat$formatted <- paste(paste(round(precs2.thetas$score.dat$z1, digits=2), round(precs2.thetas$score.dat$se.z1, digits=2), sep=" ("), ")", sep="")
+# write.csv(precs2.thetas$score.dat, file="thetas_pre_cs2.csv")
+ggplot(precs2.thetas$score.dat, aes(z1)) + geom_histogram() + labs(title="Distribution of Pre-CS2 Ability Estimates to Pre-CS1 Model")
+
+
+precs2.thetas <- ltm::factor.scores(scs1.2pl.cs1, resp.patterns = as.matrix(scs1_scores_pre_cs2), method="EAP")
+precs2.thetas$score.dat$formatted <- paste(paste(round(precs2.thetas$score.dat$z1, digits=2), round(precs2.thetas$score.dat$se.z1, digits=2), sep=" ("), ")", sep="")
+# write.csv(precs2.thetas$score.dat, file="thetas_pre_cs2.csv")
+ggplot(precs2.thetas$score.dat, aes(z1)) + geom_histogram() + labs(title="Distribution of Pre-CS2 Ability Estimates to Pre-CS1 Model")
+
+
+```
+
+
+# Distractor Analysis
+Using Norminal Response Model (NRM) to look at trace plot for all options for a given question. Looking at problems which were dropped from analysis
+Weird bug with mirt() requires me to make 2 models
+```{r}
+# there's a weird bug with mirt() where if I can nominal for all 27 items, the plots are flipped along x axis (theta=-3 probability is actually theata=3). So, i had to run 2 models where first model (mod1) has first num_questions_distractors items as nominal and remainder as dichotomous 2PL and then 2nd model (mod3) has remaining items as nominal. weird but we get our trace plots to look at probability of option selection given ability
+
+scs1_items_scored <- key2binary(scs1_items_pre, scs1_answer_key$Answer) # easy way to score something.. equiv to scs1_scores
+# write.csv(scs1_items_pre, file="scs1_items_pre.csv")
+
+mod0 <- mirt(scs1_items_scored, 1) # dichotomous
+coef(mod0)
+
+num_questions_distractors <- 22-length(DROPPED_ITEMS)
+#for first 5 items use 2PLNRM and nominal
+scs1_items_scored[,1:num_questions_distractors] <- as.matrix(scs1_items_pre[,1:num_questions_distractors]) # adding distractors back
+
+# scs1_items_scored[,1:num_questions_distractors] <- mapply(scs1_items_scored[,1:num_questions_distractors], FUN=as.numeric)
+
+# converting every value in scs1_items_scored from string to numeric
+mod1 <- mirt(apply(scs1_items_scored, 2, as.numeric), 1, c(rep('nominal',num_questions_distractors),
+                                     rep('2PL', NUM_QUESTIONS-num_questions_distractors))) # 5 + 22 = 27 items
+# mod2 <- mirt(scs1_items_scored, 1, c(rep('2PLNRM',num_questions_distractors),
+#                                      rep('2PL', NUM_QUESTIONS-num_questions_distractors)), key=scs1_answer_key$Answer)
+# anova(mod0, mod2)
+
+# coef(mod0)$Q1
+# coef(mod1)$Q1
+
+# plot 3 params
+thickness3 <- 5
+xlabel3 <- "Knowledge level"
+ylabel3 <- "Probability correct answer selected"
+
+# itemplot(mod0, 1)
+# itemplot(mod1, 1)
+# itemplot(mod1, 2)
+# nrm03 <- itemplot(mod1, 3)
+# nrm04 <- itemplot(mod1, 4)
+
+nrm05 <- itemplot(mod1, 5)
+# itemplot(mod1, 6)
+nrm07 <- itemplot(mod1, 7)
+# itemplot(mod1, 8)
+# itemplot(mod1, 9)
+# itemplot(mod1, 10)
+# itemplot(mod1, 11)
+# itemplot(mod1, 12)
+nrm13 <- itemplot(mod1, 13) # poor item fit?
+# itemplot(mod1, 14)
+nrm15 <- itemplot(mod1, 15)
+nrm16 <- itemplot(mod1, 16)
+# itemplot(mod1, 17)
+nrm18 <- itemplot(mod1, 18)
+# itemplot(mod1, 19)
+# nrm20 <- itemplot(mod1, 20) # problem item!
+# itemplot(mod1, 21)
+# itemplot(mod1, 22)
+
+#for first items use 2PL, remainder use nominal (opposite of mod1)
+scs1_items_scored <- key2binary(scs1_items_pre, scs1_answer_key$Answer) # easy way to score something.. equiv to scs1_scores
+scs1_items_scored[,(num_questions_distractors+1):NUM_QUESTIONS] <- as.matrix(scs1_items_pre[,(num_questions_distractors+1):NUM_QUESTIONS]) # adding distractors back
+mod3 <- mirt(apply(scs1_items_scored, 2, as.numeric), 1, c(rep('2PL',num_questions_distractors), rep('nominal', NUM_QUESTIONS-num_questions_distractors))) # 5 + 22 = 27 items
+
+# itemplot(mod3, 23)
+# nrm24 <- itemplot(mod3, 24)
+# itemplot(mod3, 25)
+# itemplot(mod3, 26)
+# nrm25 <- itemplot(mod3, 25)
+# nrm26 <- itemplot(mod3, 26)
+# nrm27 <- itemplot(mod3, 27)
+
+# scs1.nrm <- mirt(scs1_items, 1, "nominal")
+# itemplot(scs1.nrm, 1) # backwards! grrr....
+
+# itemplot(mirt(as.matrix(scs1_items), itemtype = "nominal", model=1), item=1)
+
+# coef(mod2)$Q3
+# itemplot(mod2, 1)
+```
+
+# plotting items that are interesting
+```{r}
+nrm_plot_nums <- c(1:27) # 19 is example of good item. 20, 24, 27 are bad
+for(q_num in nrm_plot_nums) {
+  ifelse(q_num<=num_questions_distractors,
+    plt <- itemplot(mod1, q_num, lwd=thickness3, family=FONT_SELECTED),
+    plt <- itemplot(mod3, q_num, lwd=thickness3, family=FONT_SELECTED)
+  )
+  
+  plt$panel.args.common$xlab <- "Knowledge"
+  print(plt)
+}
+```
+
+# Information for items of interest when compared to 2PL model
+(not used in paper)
+```{r}
+#compare added information from distractors
+Theta <- matrix(seq(-4,4,.01))
+par(mfrow = c(2,3))
+for(i in 1:num_questions_distractors){
+info <- iteminfo(extract.item(mod0,i), Theta) # no distractors
+info1 <- iteminfo(extract.item(mod1,i), Theta) # w/ distractors (nominal response model)
+# info2 <- iteminfo(extract.item(mod2,i), Theta) # red: w/ distractors (2PLNRM)
+
+plot(Theta, info1, type = 'l', main = paste('Information for item', i), ylab = 'Information')
+lines(Theta, info, col = 'red')
+# lines(Theta, info, col = 'red')
+}
+```
+
+
+
+# Factor scores (ability or person location estimate)
+```{r}
+# Test information function
+plot(scs1.2pl, type = "IIC", items = 0)
+
+# Factor scores for all respondents in the dataset
+scs1.EAP = ltm::factor.scores(scs1.2pl, resp.patterns = scs1_scores_pre,
+                      prior = TRUE, method = "EAP")
+
+# scs1.MAP = ltm::factor.scores(scs1.1pl, resp.patterns = scs1_scores, prior = TRUE, method = "EB")
+
+# table(round(scs1.EAP$score.dat$z1, 2)) # subtle, but values have shifted outward compared to MAP
+# hist(scs1.EAP$score.dat$z1)
+
+# title = "Distribution of Learner Knowledge Estimates",
+person_est <- ggplot(data = scs1.EAP$score.dat, aes(x=z1)) + geom_histogram() + labs(x="knowledge level", y="num. of learners") + theme_minimal() +  theme(text=element_text(family=FONT_USED))
+# ggsave("learner_est.png", plot=person_est, height = 1.5, width = 4, units="in")
+
+
+
+  # ggplot(data = scs1.MAP$score.dat, aes(x=z1)) + geom_histogram() + labs(title = "Distribution of Test-taker Ability Estimates", x="Ability", y="Number of Test-takers") + theme_minimal()
+scs1.EAP$score.dat
+summary(scs1.EAP$score.dat$z1)
+```
+
+# Wright Map
+Visualizing distribution of abilities with item difficulties
+http://wrightmap.org/post/80523814110/wrightmap-tutorial-part-1
+```{r}
+item_diff <- scs1.2pl.summary$coefficients[1:24]
+person_ability <- scs1.EAP$score.dat$z1
+
+# dev.new(width=10, height=6)
+WrightMap::wrightMap(person_ability, item_diff,
+                     main.title= "",
+                     dim.names = c(""),
+                     # axis.persons = "Distribution of Learners' CS1 Knowledge Estimates",
+                     # axis.items = "SCS1 questions",
+                     axis.persons = "",
+                     axis.items = "",
+                     show.thr.lab = FALSE, # no labels on dots
+                     # show.thr.sym = FALSE,
+                     # thr.lab.text = paste("I", 1:50, sep = ""),
+                     # thr.lab.text = paste("Q", c(1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,21,22,23,25,26), sep = ""),
+                     label.items = "",
+                     thr.sym.cex = 1,
+                     label.items.ticks = FALSE
+                     )
+
+item_diff_precs1 <- scs1.2pl.cs1.summary$coefficients[1:24] # dropping Q5 because it's -1927 and that screws up WrightMap
+person_ability_precs2 <- precs2.thetas$score.dat$z1
+
+crazy_item <- 5
+item_diff_precs1 <- item_diff_precs1[-crazy_item]
+
+# dev.new(width=10, height=6)
+WrightMap::wrightMap(person_ability_precs2, item_diff_precs1,
+                     main.title= "",
+                     dim.names = c(""),
+                     axis.persons = "Pre-CS2 Learners' Knowledge Estimates",
+                     axis.items = "SCS1 diff params (fit to pre-cs1)",
+                     # axis.persons = "",
+                     # axis.items = "",
+                     # show.thr.lab = FALSE, # no labels on dots
+                     # show.thr.sym = FALSE,
+                     # thr.lab.text = paste("I", 1:50, sep = ""),
+                     thr.lab.text = paste("Q", c(1,2,3,4,6,7,8,9,10,11,12,13,14,15,16,17,18,19,21,22,23,25,26), sep = ""),
+                     label.items = "",
+                     thr.sym.cex = 1,
+                     label.items.ticks = FALSE
+                     )
+
+```
+
+
