@@ -12,15 +12,17 @@ See [README.pdf](https://github.com/codeandcognition/archive-2019sigcse-xie/blob
 
 ## Citation: 
 
-Xie, Benjamin. 2019. “Supplementary Info for An Item Response Theory Evaluation of a Language-Independent CS1 Knowledge Assessment’' (Xie et Al. SIGCSE 2019).” https://github.com/codeandcognition/archive-2019sigcse-xie.
+Xie, Benjamin. 2019. “Supplementary Info for An Item Response Theory Evaluation of a Language-Independent CS1 Knowledge Assessment’' (Xie et Al. SIGCSE 2019).” GitHub. September 2019. https://github.com/codeandcognition/archive-2019sigcse-xie.
 
 ```
-@MISC{Xie2019-hq,
+@MISC{Xie2019-supplement,
   title        = "Supplementary Info for ''An Item Response Theory Evaluation
                   of a {Language-Independent} {CS1} Knowledge Assessment'' (Xie
                   et al. {SIGCSE} 2019)",
+  booktitle    = "{GitHub}",
   author       = "Xie, Benjamin",
+  month        =  sep,
   year         =  2019,
-  howpublished = "GitHub"
+  howpublished = "\url{https://github.com/codeandcognition/archive-2019sigcse-xie}"
 }
 ```
